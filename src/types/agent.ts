@@ -263,3 +263,39 @@ export interface QuoteLineItem {
   quantity: number | '';
   unitPriceInr: number | '';
 }
+
+export type PromptOptimizationFocus = 'balanced' | 'technical' | 'concise';
+
+export type PromptOptimizationCategory =
+  | 'technical_context'
+  | 'constraints'
+  | 'output_format'
+  | 'clarity'
+  | 'edge_cases';
+
+export interface PromptOptimizationSuggestion {
+  id: string;
+  category: PromptOptimizationCategory;
+  title: string;
+  detail: string;
+  snippet: string;
+  recommended: boolean;
+}
+
+export interface PromptOptimizationResult {
+  originalPrompt: string;
+  baseCorePrompt: string;
+  optimizedPrompt: string;
+  originalScore: number;
+  optimizedScore: number;
+  clarityRating: 'vague' | 'fair' | 'clear' | 'strong';
+  detectedIntent: string;
+  domain: string;
+  summary: string;
+  focus: PromptOptimizationFocus;
+  suggestions: PromptOptimizationSuggestion[];
+  clarifyingQuestions: string[];
+  source: 'gemini' | 'heuristic';
+  elapsedMs: number;
+}
+

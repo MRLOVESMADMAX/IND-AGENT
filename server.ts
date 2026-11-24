@@ -22,6 +22,7 @@ import { tokenVault } from './server/tokenVault.ts';
 import { userStore } from './server/userStore.ts';
 import { memoryStore } from './server/memoryStore.ts';
 import { chatJobStore } from './server/chatJobStore.ts';
+import { normalizeFocus, runPromptOptimization } from './server/promptOptimizer.ts';
 import { isForbiddenDeleteAction, redactSecrets } from './src/utils/safetyEngine.ts';
 import { PLAN_SPECS } from './src/utils/planEngine.ts';
 import {
@@ -690,6 +691,64 @@ function parseChatBody(body: Record<string, unknown>) {
     history,
   };
 }
+
+app.post('/api/agent/optimize-prompt', async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const rawMessage = typeof body.message === 'string' ? body.message.trim() : '';
+    if (!rawMessage) {
+      res.status(400).json({
+        error: 'Type a draft prompt first so the optimizer can analyze it.',
+        code: 'EMPTY_PROMPT',
+      });
+      return;
+    }
+    if (rawMessage.length > 6000) {
+      res.status(400).json({
+        error: 'Prompt is too long to optimize (maximum 6,000 characters).',
+        code: 'PROMPT_TOO_LONG',
+      });
+      return;
+    }
+
+    const mode: AgentMode =
+      body.mode === 'coding' || body.mode === 'business' ? body.mode : 'auto';
+    const focus = normalizeFocus(body.focus);
+
+    const rawHistory = Array.isArray(body.history) ? body.history : [];
+    const history = rawHistory
+      .filter(
+        (item): item is { role: 'user' | 'assistant'; content: string } =>
+          Boolean(item) &&
+          typeof item === 'object' &&
+          ((item as { role?: unknown }).role === 'user' ||
+            (item as { role?: unknown }).role === 'assistant') &&
+          typeof (item as { content?: unknown }).content === 'string'
+      )
+      .slice(-4)
+      .map((item) => ({
+        role: item.role,
+        content: item.content.slice(0, 8000),
+      }));
+
+    const result = await runPromptOptimization({
+      message: rawMessage,
+      mode,
+      focus,
+      history,
+    });
+
+    res.json(result);
+  } catch (err) {
+    const safeMsg = redactSecrets(
+      err instanceof Error ? err.message : 'Prompt optimization failed.'
+    );
+    res.status(502).json({
+      error: safeMsg,
+      code: 'OPTIMIZER_ERROR',
+    });
+  }
+});
 
 app.post('/api/agent/chat', async (req, res) => {
   const userId = await resolveRequestUserId(req, res);

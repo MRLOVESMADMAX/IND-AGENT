@@ -18,6 +18,8 @@ import type {
   MemoryFact,
   ModelChoice,
   PendingAction,
+  PromptOptimizationFocus,
+  PromptOptimizationResult,
   ToolStatusSummary,
   UserAccountSummary,
 } from '../types/agent';
@@ -266,6 +268,25 @@ export async function disconnectDrive(): Promise<void> {
     credentials: 'include',
   });
   await handleResponse<{ ok: boolean }>(res);
+}
+
+export interface OptimizePromptRequestPayload {
+  message: string;
+  mode: AgentMode;
+  focus?: PromptOptimizationFocus;
+  history?: Array<{ role: 'user' | 'assistant'; content: string }>;
+}
+
+export async function optimizeUserPrompt(
+  payload: OptimizePromptRequestPayload
+): Promise<PromptOptimizationResult> {
+  const res = await fetch('/api/agent/optimize-prompt', {
+    method: 'POST',
+    headers: await buildAuthHeaders(true),
+    credentials: 'include',
+    body: JSON.stringify(payload),
+  });
+  return handleResponse<PromptOptimizationResult>(res);
 }
 
 export interface AgentChatRequestPayload {

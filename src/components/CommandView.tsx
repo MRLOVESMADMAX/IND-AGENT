@@ -28,6 +28,7 @@ import {
   RotateCcw,
   ShieldCheck,
   Sliders,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
   User,
@@ -37,6 +38,8 @@ import {
 } from 'lucide-react';
 import { MessageRenderer } from './MessageRenderer';
 import { ActionCard } from './ActionCard';
+import { PromptOptimizerPanel } from './PromptOptimizerPanel';
+import { optimizeUserPrompt } from '../services/api';
 import {
   MAX_TEXT_FILE_CHARS,
   formatBytes,
@@ -61,6 +64,8 @@ import type {
   MemoryFact,
   ModelChoice,
   PendingAction,
+  PromptOptimizationFocus,
+  PromptOptimizationResult,
   SkillDefinition,
   ToolStatusSummary,
   UserAccountSummary,
@@ -502,6 +507,15 @@ export function CommandView({
   const [drawerTab, setDrawerTab] = useState<'memory' | 'workspace'>('memory');
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
 
+  // System Prompt Optimizer state
+  const [optimizerOpen, setOptimizerOpen] = useState(false);
+  const [optimizerFocus, setOptimizerFocus] = useState<PromptOptimizationFocus>('balanced');
+  const [optimizerLoading, setOptimizerLoading] = useState(false);
+  const [optimizerError, setOptimizerError] = useState<string | null>(null);
+  const [optimizerResult, setOptimizerResult] = useState<PromptOptimizationResult | null>(null);
+  const [optimizerRawSnapshot, setOptimizerRawSnapshot] = useState('');
+  const optimizerReqIdRef = useRef(0);
+
   // Close + composer menu on outside click or Escape
   useEffect(() => {
     if (!composerMenuOpen) return;
@@ -521,11 +535,14 @@ export function CommandView({
     };
   }, [composerMenuOpen]);
 
-  // Clear pending attachments and errors when switching chats
+  // Clear pending attachments, errors, and optimizer overlay when switching chats
   useEffect(() => {
     setAttachments([]);
     setInputError(null);
     setComposerMenuOpen(false);
+    setOptimizerOpen(false);
+    setOptimizerResult(null);
+    setOptimizerError(null);
   }, [sessionId]);
 
   const handleCopyAssistantReply = async (msgId: string, text: string) => {
@@ -685,7 +702,91 @@ export function CommandView({
     window.requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
+  const runPromptOptimizer = async (
+    rawText: string,
+    targetFocus: PromptOptimizationFocus
+  ) => {
+    const trimmed = rawText.trim();
+    if (!trimmed) {
+      setInputError('Type a draft prompt first to optimize it for Gemini.');
+      window.requestAnimationFrame(() => textareaRef.current?.focus());
+      return;
+    }
+
+    const reqId = optimizerReqIdRef.current + 1;
+    optimizerReqIdRef.current = reqId;
+    setInputError(null);
+    setComposerMenuOpen(false);
+    setOptimizerRawSnapshot(trimmed);
+    setOptimizerFocus(targetFocus);
+    setOptimizerOpen(true);
+    setOptimizerLoading(true);
+    setOptimizerError(null);
+
+    try {
+      const recentHistory = safeMessages.slice(-4).map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+      const optimized = await optimizeUserPrompt({
+        message: trimmed,
+        mode,
+        focus: targetFocus,
+        history: recentHistory,
+      });
+      if (optimizerReqIdRef.current !== reqId) return;
+      setOptimizerResult(optimized);
+    } catch (err) {
+      if (optimizerReqIdRef.current !== reqId) return;
+      setOptimizerError(
+        err instanceof Error
+          ? err.message
+          : 'Could not optimize your prompt right now. Please try again.'
+      );
+    } finally {
+      if (optimizerReqIdRef.current === reqId) {
+        setOptimizerLoading(false);
+      }
+    }
+  };
+
+  const handleOpenOptimizer = () => {
+    if (sending) return;
+    void runPromptOptimizer(draftInput, optimizerFocus);
+  };
+
+  const handleChangeOptimizerFocus = (nextFocus: PromptOptimizationFocus) => {
+    if (nextFocus === optimizerFocus && optimizerResult) return;
+    const baseText = optimizerRawSnapshot || draftInput;
+    void runPromptOptimizer(baseText, nextFocus);
+  };
+
+  const handleApplyOptimizedPrompt = (optimizedPrompt: string) => {
+    onDraftInputChange(optimizedPrompt);
+    setOptimizerOpen(false);
+    setInputError(null);
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+    });
+  };
+
+  const handleSendOptimizedPrompt = async (optimizedPrompt: string) => {
+    const trimmed = optimizedPrompt.trim();
+    if (!trimmed || sending) return;
+    setOptimizerOpen(false);
+    setInputError(null);
+    const toSend = attachments;
+    setAttachments([]);
+    await onSend(trimmed, toSend);
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'o') {
+      e.preventDefault();
+      handleOpenOptimizer();
+      return;
+    }
+
     if (showSlashPalette) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -1012,6 +1113,23 @@ export function CommandView({
                     {safeSkills.length}
                   </span>
                 </button>
+                <button
+                  type="button"
+                  disabled={sending}
+                  onClick={() => {
+                    setComposerMenuOpen(false);
+                    handleOpenOptimizer();
+                  }}
+                  className="flex w-full items-center justify-between gap-3 rounded-2xl px-3.5 py-2.5 text-left text-sm text-[#1F1F1F] dark:text-[#E3E3E3] hover:bg-[#F2F4F8] dark:hover:bg-[#282A2C] transition-colors"
+                >
+                  <span className="inline-flex items-center gap-3">
+                    <SlidersHorizontal className="h-4 w-4 text-[#1A73E8] dark:text-[#8AB4F8]" />
+                    <span>System Prompt Optimizer</span>
+                  </span>
+                  <span className="font-mono text-[10px] text-[#5F6368] dark:text-[#9AA0A6]">
+                    ⇧⌘O
+                  </span>
+                </button>
               </div>
 
               <div className="border-t border-[#F0F4F9] dark:border-[#2E3033] pt-1.5 px-2">
@@ -1182,6 +1300,34 @@ export function CommandView({
               placeholder="Try / for more"
               className="min-h-[28px] max-h-[140px] flex-1 resize-none bg-transparent py-1.5 text-[16px] leading-snug text-[#1F1F1F] dark:text-[#E3E3E3] placeholder:text-[#747775] dark:placeholder:text-[#9AA0A6] focus:outline-none"
             />
+
+            {/* System Prompt Optimizer Trigger */}
+            <button
+              type="button"
+              disabled={sending}
+              onClick={handleOpenOptimizer}
+              data-testid="composer-optimize-btn"
+              aria-label="Optimize prompt for Gemini"
+              title={
+                draftInput.trim()
+                  ? 'Optimize prompt for Gemini (Ctrl+Shift+O)'
+                  : 'Type a draft prompt to optimize it for Gemini'
+              }
+              className={`inline-flex shrink-0 items-center justify-center gap-1.5 rounded-full transition-colors disabled:opacity-50 whitespace-nowrap ${
+                draftInput.trim().length > 0
+                  ? 'h-10 px-3 sm:px-3.5 bg-[#F0F4F9] dark:bg-[#282A2C] text-[#1A73E8] dark:text-[#8AB4F8] hover:bg-[#E4ECF7] dark:hover:bg-[#333537] text-xs font-medium'
+                  : 'h-10 w-10 text-[#5F6368] dark:text-[#9AA0A6] hover:bg-[#F2F4F8] dark:hover:bg-[#282A2C] hover:text-[#1F1F1F] dark:hover:text-[#E3E3E3]'
+              }`}
+            >
+              {optimizerLoading ? (
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <SlidersHorizontal className="h-[17px] w-[17px]" strokeWidth={1.8} aria-hidden="true" />
+              )}
+              {draftInput.trim().length > 0 && (
+                <span className="hidden sm:inline">Optimize</span>
+              )}
+            </button>
 
             {/* Right Quick Skills / Slash Button */}
             <button
@@ -2059,6 +2205,21 @@ export function CommandView({
           </aside>
         </div>
       )}
+
+      <PromptOptimizerPanel
+        open={optimizerOpen}
+        rawPrompt={optimizerRawSnapshot || draftInput}
+        focus={optimizerFocus}
+        loading={optimizerLoading}
+        error={optimizerError}
+        result={optimizerResult}
+        sending={sending}
+        onChangeFocus={handleChangeOptimizerFocus}
+        onRetry={() => void runPromptOptimizer(optimizerRawSnapshot || draftInput, optimizerFocus)}
+        onClose={() => setOptimizerOpen(false)}
+        onApplyToComposer={handleApplyOptimizedPrompt}
+        onSendOptimized={(prompt) => void handleSendOptimizedPrompt(prompt)}
+      />
     </div>
   );
 }

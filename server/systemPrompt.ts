@@ -6,6 +6,10 @@ import type {
   CodeVerificationIssue,
   FollowUpCodeEditContext,
 } from './codeVerifier.ts';
+import {
+  formatPromptBriefForSystemPrompt,
+  type PromptUnderstandingBrief,
+} from './promptUnderstanding.ts';
 
 export function buildIndAgentSystemPrompt(
   mode: AgentMode,
@@ -19,6 +23,7 @@ export function buildIndAgentSystemPrompt(
     memoryEnabled?: boolean;
     memoryFacts?: MemoryFact[];
     intent?: CodingIntentAnalysis;
+    promptBrief?: PromptUnderstandingBrief;
     followUpEdit?: FollowUpCodeEditContext;
     customInstructions?: string;
   }
@@ -29,23 +34,28 @@ export function buildIndAgentSystemPrompt(
   const memoryEnabled = context.memoryEnabled !== false;
   const memoryFacts = Array.isArray(context.memoryFacts) ? context.memoryFacts : [];
   const intent = context.intent;
+  const promptBrief = context.promptBrief;
+  const isPromptEngineering = Boolean(
+    promptBrief?.isPromptEngineering || intent?.kind === 'prompt_engineering'
+  );
   const customInstructions =
     typeof context.customInstructions === 'string'
       ? context.customInstructions.trim().slice(0, 1500)
       : '';
 
-  const wantsBackend = Boolean(intent?.wantsBackend);
+  const wantsBackend = Boolean(intent?.wantsBackend) && !isPromptEngineering;
 
-  const modeGuidance =
-    mode === 'coding'
+  const modeGuidance = isPromptEngineering
+    ? 'ACTIVE MODE: PROMPT ENGINEERING (TEXT PROMPT ONLY — DO NOT BUILD CODE OR WEBSITES). The user asked you to WRITE or CRAFT a copy-ready prompt. Output ONLY the engineered prompt inside a ```prompt:<Descriptive Title> block (plus 1-3 short usage tips outside). NEVER build an HTML website or write code files unless the user explicitly asked you to build the app itself.'
+    : mode === 'coding'
       ? isHyper
         ? 'ACTIVE MODE: CODING MODE (IND HYPER CODING MODEL). Take your time to think deeply from first principles and engineer an epic, museum-grade, deeply detailed implementation (650–1,100+ lines for websites/apps, 550–900+ lines for libraries/systems). Keep chat prose crisp (2–4 lines like Claude Artifacts) and put your full power into crafting extraordinary, complete, production-ready code.'
         : 'ACTIVE MODE: CODING MODE (Standard). Deliver clean, complete, working code (single-file HTML artifact for websites, or clean modular code for scripts) with a concise 1-3 line explanation.'
       : mode === 'business'
         ? 'ACTIVE MODE: BUSINESS MODE. Help with customer replies (matching the customer language), exact invoices/quotes, order tracking, support emails, marketing copy, summaries, and to-dos.'
         : isHyper
-          ? 'ACTIVE MODE: AUTO (IND HYPER CODING MODEL). Automatically adapt between flagship-grade Coding/Website Artifact creation and Business Mode. For websites and coding builds, take your time to architect deeply and deliver epic, comprehensive, studio-grade artifacts.'
-          : 'ACTIVE MODE: AUTO. Automatically adapt between Coding Mode and Business Mode based on the user request.';
+          ? 'ACTIVE MODE: AUTO (IND HYPER CODING MODEL). Automatically adapt between flagship-grade Coding/Website Artifact creation, Prompt Engineering, and Business Mode based on the user request. Only build website artifacts when the user actually asks to build/create a website or web app.'
+          : 'ACTIVE MODE: AUTO. Automatically adapt between Coding Mode, Prompt Engineering, and Business Mode based on the user request.';
 
   const connectionsLine = `Current user's connected integrations -> Gmail: ${
     context.gmail ? 'CONNECTED' : 'NOT CONNECTED'
@@ -67,8 +77,23 @@ export function buildIndAgentSystemPrompt(
       : `\n## CHAT MEMORY (ACTIVE)\nNo saved memory facts yet. When the user explicitly asks you to remember a preference, coding stack, or project detail, call \`save_memory_fact\` (never store passwords, API keys, or secrets).`
     : `\n## CHAT MEMORY (PAUSED)\nChat memory is currently switched OFF by the user. Do not call \`save_memory_fact\`.`;
 
+  const promptBriefBlock = promptBrief
+    ? `\n\n${formatPromptBriefForSystemPrompt(promptBrief)}`
+    : '';
+
+  const promptEngineeringOnlySpec = isPromptEngineering
+    ? `
+## PROMPT WRITING ONLY — STRICT NO-WEBSITE / NO-CODE RULE (HIGHEST PRIORITY)
+The user explicitly asked you to **WRITE, CRAFT, OR IMPROVE A PROMPT** (copyable text instructions) — **NOT** to build a website, web app, or code!
+1. **STRICTLY DO NOT BUILD A WEBSITE OR EMIT HTML/CSS/JS CODE**: Even if the prompt is *about* building a website, portfolio, landing page, or app, do **NOT** output \`\`\`html, \`<!DOCTYPE html>\`, CSS, JavaScript, or code files. Your deliverable is the **prompt text itself**.
+2. **DELIVER ONE COPY-READY \`\`\`prompt:<Title> BLOCK**:
+   - Wrap the complete, richly detailed, immediately copyable prompt inside \`\`\`prompt:<Short Descriptive Title> ... \`\`\`.
+   - Structure the prompt clearly with Role/Persona, Goal, Visual/Art Direction, Key Sections/Features, Technical & Quality Constraints, Negative Constraints, and clean \`[BRACKET_PLACEHOLDERS]\` for customizable details.
+3. **CLEAN SURROUNDING PROSE**: Add at most 1–2 short lines introducing the prompt and 2–3 concise customization tips outside the block so clicking "Copy Prompt" copies ONLY pure prompt text.`
+    : '';
+
   const fullStackWebsiteSpec =
-    intent?.isWebsiteOrFullStack || isHyper
+    !isPromptEngineering && intent?.isWebsiteOrFullStack
       ? `
 ## CLAUDE-STYLE INTERACTIVE WEBSITE ARTIFACT & STUDIO UI CONSTITUTION (CRITICAL)
 IND AGENT renders HTML outputs directly inside a live side-by-side **Interactive Website Artifact Workbench** (just like Claude Artifacts). When building ANY website, landing page, web app, SaaS dashboard, portfolio, store, calculator, or interactive tool:
@@ -107,8 +132,9 @@ IND AGENT renders HTML outputs directly inside a live side-by-side **Interactive
    - Zero horizontal overflow at \`390px\` mobile, \`768px\` tablet, and \`1440px\` desktop.`
       : '';
 
-  const highLevelEngineeringSpec =
-    intent?.isLuaUiLibrary
+  const highLevelEngineeringSpec = isPromptEngineering
+    ? ''
+    : intent?.isLuaUiLibrary
       ? `
 ## HIGH-LEVEL ROBLOX / LUAU UI LIBRARY ARCHITECTURE STANDARD (CRITICAL — STRICTLY ENFORCED)
 When the user asks for a Lua / Luau UI Library:
@@ -136,14 +162,16 @@ The user is asking for a **high-level, production-grade implementation** — NEV
 2. **Full Real Architecture**: Include clean modular classes/modules, state management, configuration/theme options, complete feature set (all core methods/components implemented, zero \`TODO\`s or \`// add more here\`), thorough input validation, error handling, memory/resource cleanup, and a complete runnable **Usage / Demo** block or test harness.`
         : '';
 
-  const hyperInstructions = isHyper
-    ? `
+  const hyperInstructions = isPromptEngineering
+    ? ''
+    : isHyper
+      ? `
 ## IND HYPER CODING MODEL PROTOCOL (PLUS — EPIC QUALITY & UNHURRIED CRAFT)
 - **Prioritize Extraordinary Quality & Depth Over Brevity**: Take your time to think thoroughly and build something genuinely epic, memorable, and far richer than a standard model response.
-- **Substantial, Complete Code**: Write long, deeply detailed, production-ready implementations (650–1,100+ lines for interactive websites/web apps/games, 550–900+ lines for Lua/Luau libraries & complex engines, 350–700+ lines for backend/CLI/tools). NEVER abbreviate, NEVER omit sections, NEVER write \`// ...rest of code\` or \`// TODO\`.
+- **Substantial, Complete Code**: When building code or websites, write long, deeply detailed, production-ready implementations (650–1,100+ lines for interactive websites/web apps/games, 550–900+ lines for Lua/Luau libraries & complex engines, 350–700+ lines for backend/CLI/tools). NEVER abbreviate, NEVER omit sections, NEVER write \`// ...rest of code\` or \`// TODO\`.
 - **Claude-Style Artifact Presentation**: For websites and interactive apps, write 2–4 crisp lines introducing your design direction and interactive capabilities, then deliver the flagship \`\`\`html:index.html artifact (plus backend files only if explicitly requested).
 - **Zero-Defect Polish**: Anticipate null/undefined checks, responsive mobile/tablet/desktop layouts, keyboard accessibility (ESC modals, focus states), empty/loading/toast feedback states, and smooth visual transitions.`
-    : `
+      : `
 ## CODING MODE (STANDARD)${fastMode ? ' — FAST MODE' : ''}
 - Write **clean, complete, working code** — never placeholder comments like "add your code here".
 - For websites, portfolios, dashboards, or web apps: deliver a clean, self-contained \`\`\`html:index.html artifact (adding \`server.js\` + \`package.json\` only when backend/full-stack is requested).
@@ -151,8 +179,9 @@ The user is asking for a **high-level, production-grade implementation** — NEV
 - When fixing bugs: state the root cause clearly, then give the full fixed code.`;
 
   const followUpEdit = context.followUpEdit;
-  const followUpEditProtocol = followUpEdit?.isFollowUpEdit
-    ? `
+  const followUpEditProtocol =
+    !isPromptEngineering && followUpEdit?.isFollowUpEdit
+      ? `
 ## IN-PLACE SURGICAL FIX & FULL-FILE PRESERVATION PROTOCOL (MANDATORY — HIGHEST PRIORITY)
 The user is asking to **FIX, ADJUST, OR UPDATE existing code** already created in this conversation (${followUpEdit.previousFileNames.join(', ') || 'previous code'}, ~${followUpEdit.previousLineCount} lines).
 1. **NEVER REWRITE FROM ZERO / NEVER REDESIGN**:
@@ -163,24 +192,28 @@ The user is asking to **FIX, ADJUST, OR UPDATE existing code** already created i
    - STRICTLY FORBIDDEN: partial 5–30 line snippets, unified diffs, or comments like \`// ... rest of code unchanged\`, \`/* existing styles */\`, or \`<!-- keep existing HTML -->\`.
    - ALWAYS return the **COMPLETE, 100% self-contained, drop-in updated file(s)** inside the matching labeled fenced code block (${followUpEdit.previousHasHtmlArtifact ? '\`\`\`html:index.html' : 'with the exact same filename label'}) so the live Artifact preview and Copy/Download buttons work immediately with zero missing code.
 3. **Crisp Fix Summary**: Before the complete updated code block, state in 1–2 concise lines what caused the issue and exactly what you updated.`
-    : '';
+      : '';
 
-  const codingDiscipline = `
+  const codingDiscipline = isPromptEngineering
+    ? ''
+    : `
 ## DEEP PROMPT UNDERSTANDING & DEBUGGING LOOP PROTOCOL
 ${intent ? `- Detected user intent: **${intent.summary}** (languages: ${intent.languages.length > 0 ? intent.languages.join(', ') : 'auto'}).` : ''}
 - **Understand the full intent before coding**: Parse both explicit requirements and implicit real-world expectations (edge cases, empty/null inputs, responsive layout, clean UX, error states, and exact user constraints). If the user gives a short prompt like "make a portfolio", infer a complete, realistic, polished full-stack product instead of a bare skeleton.
+- **Honor EVERY constraint & negative rule**: If the user specifies a brand name, color palette, language, or negative rule (e.g. "no purple", "without login", "don't change header"), follow it 100% literally.
 - **In-place root-cause debugging (NEVER restart from zero & NEVER truncate)**: When the user asks to fix a bug in existing code (either from earlier in this chat or pasted by the user), first diagnose the **exact root cause** in 1–2 lines, preserve all existing working structure/design/features untouched, apply ONLY the targeted fix, and return the **COMPLETE drop-in fixed file** — NEVER rewrite the entire project into a different design from scratch and NEVER return a partial few-line snippet with \`// ... rest unchanged\`.
 - **Iterative verify-and-debug tool (\`verify_code_snippet\`)**:${
-    debugLoop
-      ? ' Debug Loop is ON. When debugging broken code or writing tricky algorithms/parsers, call `verify_code_snippet` (with `testCode` using `assertEqual(actual, expected)` / `assert(cond)`) to test your logic before replying. (For full-stack websites, our automatic verifier checks all HTML/JS/JSON syntax and DOM IDs immediately after generation.)'
-      : ' Debug Loop is currently toggled OFF; still double-check syntax, DOM IDs, and edge cases carefully.'
-  }
+        debugLoop
+          ? ' Debug Loop is ON. When debugging broken code or writing tricky algorithms/parsers, call `verify_code_snippet` (with `testCode` using `assertEqual(actual, expected)` / `assert(cond)`) to test your logic before replying. (For full-stack websites, our automatic verifier checks all HTML/JS/JSON syntax and DOM IDs immediately after generation.)'
+          : ' Debug Loop is currently toggled OFF; still double-check syntax, DOM IDs, and edge cases carefully.'
+      }
 - **Zero broken DOM wiring**: In HTML/JS apps, ensure every \`document.getElementById("...")\` or \`querySelector("#...")\` matches an actual \`id="..."\` in the HTML, and guard against \`null\`/\`undefined\` and invalid user inputs.`;
 
   return `You are IND AGENT, a frontier-grade multi-user AI software engineer, architect, and business operations assistant. Think with the rigor of a principal engineer and communicate with the crisp editorial clarity of Claude, ChatGPT, and Gemini. Each user connects their own Gmail and Google Drive accounts — never assume or hardcode any personal account details.
 
 ## FRONTIER INTELLIGENCE & REASONING STANDARD
 - **First-Principles Problem Solving**: Before writing a single line, infer the user's deeper goal, real-world constraints, edge cases, failure modes, security boundaries, and ergonomic defaults. Do not ask unnecessary clarifying questions when the intent is clear — make smart, idiomatic engineering decisions and state key assumptions briefly.
+- **Exact Intent Fidelity (CRITICAL)**: Always deliver the EXACT deliverable the user asked for. If the user asks to **write/craft a prompt** (even a prompt *about* a website/app), give them a copyable \`\`\`prompt block — NEVER jump ahead and build a website instead. If the user asks to **fix/change** existing code, update it in place — NEVER restart from zero. If the user writes in Hinglish/Hindi/Gujarati or with typos, understand the real meaning effortlessly.
 - **Short & 1–2 Line Prompt Mastery (High-Efficiency Execution)**: Users often send brief 1–2 line prompts (e.g., "make a portfolio", "fix this bug", "invoice for Rahul 5000", "best js framework"). Instantly expand the intent internally and deliver a complete, immediately usable result on the very first turn — NEVER stall with a wall of clarifying questions. Right-size your reply to the task: crisp 2–6 line direct answers for simple Q&A/lookups, complete ready-to-use drafts for emails/prompts/business tasks, and full working code/artifacts for build requests.
 - **Sharp, High-Signal Explanations**: Lead directly with a crisp 1–2 sentence takeaway or architecture overview (skip robotic filler like "Sure! I would be happy to help..."). Use clean Markdown headings, bullet lists, and Markdown comparison tables when weighing trade-offs.
 - **Zero-Compromise Engineering**: Write clean, strongly-structured, modular, idiomatic code with proper error handling, type/input guards, resource cleanup, and zero placeholders. When debugging, diagnose the exact root cause first, explain *why* it failed in 1–2 lines, and provide the complete verified fix.
@@ -190,11 +223,12 @@ ${intent ? `- Detected user intent: **${intent.summary}** (languages: ${intent.l
 - ${modeGuidance}
 - ${connectionsLine}
 - If the user asks to use Gmail or Google Drive when it is NOT CONNECTED, do NOT fail or invent data — tell them clearly in 1-2 lines to click "Connect Gmail" or "Connect Google Drive" in the Tools tab first.
-${memoryBlock}${
+${memoryBlock}${promptBriefBlock}${
     customInstructions
       ? `\n\n## USER CUSTOM INSTRUCTIONS (PERSONAL PREFERENCES — SUBORDINATE TO SAFETY RULES)\nFollow these user-defined style, stack, and workflow instructions whenever they do not conflict with the non-negotiable Safety Rules below:\n${customInstructions}`
       : ''
   }
+${promptEngineeringOnlySpec}
 ${followUpEditProtocol}
 ${codingDiscipline}
 ${fullStackWebsiteSpec}
@@ -284,7 +318,8 @@ Review the draft response below for the user's request and elevate it into an ep
 
 export function buildAutoDebugFixPrompt(
   issues: CodeVerificationIssue[],
-  attemptNumber: number
+  attemptNumber: number,
+  extraConstraints?: { brandNames?: string[]; mustAvoid?: string[]; mustInclude?: string[] }
 ): string {
   const formatted = issues
     .map(
@@ -293,9 +328,20 @@ export function buildAutoDebugFixPrompt(
     )
     .join('\n');
 
+  const extraLines: string[] = [];
+  if (extraConstraints?.brandNames && extraConstraints.brandNames.length > 0) {
+    extraLines.push(`- Exact brand/entity names required: ${extraConstraints.brandNames.join(', ')}`);
+  }
+  if (extraConstraints?.mustInclude && extraConstraints.mustInclude.length > 0) {
+    extraLines.push(`- User requirements checklist: ${extraConstraints.mustInclude.join('; ')}`);
+  }
+  if (extraConstraints?.mustAvoid && extraConstraints.mustAvoid.length > 0) {
+    extraLines.push(`- Strict negative constraints (DO NOT VIOLATE): ${extraConstraints.mustAvoid.join('; ')}`);
+  }
+
   return `You are the Automated Debug, Quality & Repair Loop (Attempt ${attemptNumber}) for IND AGENT.
 Our static syntax, DOM & UI quality verifier found the following exact issue(s) in your previous response:
-${formatted}
+${formatted}${extraLines.length > 0 ? `\n\nAdditional verified user constraints:\n${extraLines.join('\n')}` : ''}
 
 Rules:
 1. Fix EVERY listed error cleanly at the root cause.

@@ -1,6 +1,11 @@
 import vm from 'node:vm';
 import { transformSync } from 'esbuild';
 import type { AgentMode, ChatAttachment } from '../src/types/agent.ts';
+import {
+  HINGLISH_EDIT_FIX_RE,
+  isPromptWritingRequest,
+  normalizeUserPromptText,
+} from './promptUnderstanding.ts';
 
 export type PromptIntentKind =
   | 'build_app'
@@ -8,6 +13,7 @@ export type PromptIntentKind =
   | 'refactor'
   | 'roblox_luau'
   | 'explain_code'
+  | 'prompt_engineering'
   | 'business_ops'
   | 'general';
 
@@ -68,10 +74,28 @@ export function analyzeCodingIntent(
   mode: AgentMode,
   attachments?: ChatAttachment[]
 ): CodingIntentAnalysis {
-  const text = (message ?? '').trim();
+  const rawText = (message ?? '').trim();
+  const text = normalizeUserPromptText(rawText);
   const lower = text.toLowerCase();
   const safeAtts = Array.isArray(attachments) ? attachments : [];
   const hasCodeAttachment = safeAtts.some((a) => CODE_FILE_EXT_RE.test(a?.name ?? ''));
+
+  // CRITICAL: If user asked to WRITE / CRAFT A PROMPT (even about a website/app),
+  // NEVER classify it as building a website or writing code!
+  if (isPromptWritingRequest(text)) {
+    return {
+      kind: 'prompt_engineering',
+      isCodingTask: false,
+      isDebuggingTask: false,
+      isWebsiteOrFullStack: false,
+      isHighLevelBuild: false,
+      isLuaUiLibrary: false,
+      languages: [],
+      wantsMultiFile: false,
+      wantsBackend: false,
+      summary: 'Crafting copy-ready prompt (text prompt only — not building code/website)',
+    };
+  }
 
   const languages: string[] = [];
   const addLang = (lang: string) => {
@@ -84,7 +108,7 @@ export function analyzeCodingIntent(
   if (/\b(typescript|tsx|\.ts\b|tsconfig)\b/i.test(text)) addLang('TypeScript');
   if (/\b(react|jsx|usestate|useeffect|next\.?js|tailwind)\b/i.test(text)) addLang('React');
   if (/\b(javascript|node\.?js|express|vanilla js|\.js\b)\b/i.test(text)) addLang('JavaScript');
-  if (/\b(html|css|single[- ]file|webpage|website|landing page|calculator|dashboard|ui)\b/i.test(text)) {
+  if (/\b(html|css|single[- ]file|webpage|website|site|landing\s*page|calculator|dashboard|ui)\b/i.test(text)) {
     addLang('HTML/CSS');
   }
   if (/\b(python|flask|fastapi|django|pandas|\.py\b)\b/i.test(text)) addLang('Python');
@@ -103,10 +127,10 @@ export function analyzeCodingIntent(
   const hasStackTraceOrError =
     /\b(typeerror|referenceerror|syntaxerror|uncaught|stack\s*trace|cannot read properties|undefined is not|is not a function|nan|crash|bug|broken|error:|exception|traceback|failing|doesn'?t work|not working|debug|fix)\b/i.test(
       text
-    );
+    ) || /\b(thik\s*karo|theek\s*karo|sahi\s*karo|kaam\s*nahi\s*kar\s*raha|nahi\s*chal\s*raha|fix\s*karo|fix\s*krdo)\b/i.test(rawText);
 
   const hasBuildKeywords =
-    /\b(build|create|make|write|code|generate|implement|develop|script|app|website|tool|component|function|algorithm|game|calculator|converter|bot|scraper|server|endpoint)\b/i.test(
+    /\b(build|create|make|write|code|generate|implement|develop|script|app|website|site|tool|component|function|algorithm|game|calculator|converter|bot|scraper|server|endpoint|banao|bana\s*do|bna\s*do|bnao|taiyar\s*karo)\b/i.test(
       text
     );
 
@@ -114,7 +138,7 @@ export function analyzeCodingIntent(
     /\b(refactor|optimize|clean up|improve|rewrite|convert|migrate|upgrade|speed up)\b/i.test(text);
 
   const hasExplainKeywords =
-    /\b(explain|how does|walk me through|what does this code|review this code)\b/i.test(text);
+    /\b(explain|how does|walk me through|what does this code|review this code|samjhao)\b/i.test(text);
 
   const hasBusinessKeywords =
     /\b(invoice|quote|quotation|gst|customer|client|gmail|email|reply|draft|order|hosting|pricing|marketing|summary|to-do|todo|whatsapp|hindi|gujarati)\b/i.test(
@@ -135,7 +159,7 @@ export function analyzeCodingIntent(
   const isWebsiteOrFullStack =
     !explicitSingleFile &&
     !languages.includes('Luau') &&
-    /\b(portfolio|website|web\s*site|web\s*app|landing\s*page|full[- ]?stack|saas|dashboard|e-?commerce|online\s*store|shop|blog|agency\s*site|booking\s*site|crm|cms|marketplace|social\s*app|admin\s*panel|resume\s*site)\b/i.test(
+    /\b(portfolio|website|web\s*site|web\s*app|landing\s*page|full[- ]?stack|saas|dashboard|e-?commerce|online\s*store|shop|blog|agency\s*site|booking\s*site|crm|cms|marketplace|social\s*app|admin\s*panel|resume\s*site|(?:make|build|create|design|banao|bana\s*do|bnao)\s+(?:me\s+)?(?:a\s+|an\s+|ek\s+)?(?:[\w-]+\s+){0,3}(?:site|web|page|storefront|cafe|coffee\s*shop|restaurant|gym))\b/i.test(
       text
     );
   const isHighLevelBuild =
@@ -154,7 +178,7 @@ export function analyzeCodingIntent(
     /\b(multi[- ]file|project|zip|folder structure|separate files)\b/i.test(text);
 
   const isDebuggingTask =
-    hasStackTraceOrError && (mode === 'coding' || hasInlineCode || hasCodeAttachment || languages.length > 0 || /\b(bug|debug|fix|error|crash|code|script|function|app|html|js)\b/i.test(text));
+    hasStackTraceOrError && (mode === 'coding' || hasInlineCode || hasCodeAttachment || languages.length > 0 || /\b(bug|debug|fix|error|crash|code|script|function|app|html|js|button|toggle|page|website|site|thik|kaam\s*nahi)\b/i.test(text));
 
   let kind: PromptIntentKind = 'general';
   if (mode === 'business' && !hasInlineCode && !hasCodeAttachment && !isWebsiteOrFullStack) {
@@ -344,22 +368,27 @@ export function detectFollowUpCodeEdit(
 
   if (latestBlocks.length === 0) return empty;
 
-  const text = (message ?? '').trim();
+  const rawText = (message ?? '').trim();
+  const text = normalizeUserPromptText(rawText);
+  // Asking to write/generate a prompt is NEVER a follow-up edit to previous HTML/code
+  if (isPromptWritingRequest(text)) return empty;
+
   const explicitStartFresh =
-    /\b(start\s+(over|from\s+scratch|fresh)|from\s+scratch|brand\s+new\s+(website|app|project|site)|completely\s+new\s+(website|app|design|project)|ignore\s+(the\s+)?previous|forget\s+(the\s+)?previous|build\s+a\s+different)\b/i.test(
+    /\b(start\s+(over|from\s+scratch|fresh)|from\s+scratch|brand\s+new\s+(website|app|project|site)|completely\s+new\s+(website|app|design|project)|ignore\s+(the\s+)?previous|forget\s+(the\s+)?previous|build\s+a\s+different|naya\s+(website|site|app|design)\s+banao)\b/i.test(
       text
     );
   if (explicitStartFresh) return empty;
 
   const isPureExplanation =
-    /^(explain|what\s+does|how\s+does|why\s+did\s+you|summarize|walk\s+me\s+through)\b/i.test(text) &&
-    !/\b(fix|change|update|edit|add|remove|replace|modify|refactor|repair|make\s+it|adjust|style)\b/i.test(text);
+    /^(explain|what\s+does|how\s+does|why\s+did\s+you|summarize|walk\s+me\s+through|samjhao)\b/i.test(text) &&
+    !/\b(fix|change|update|edit|add|remove|replace|modify|refactor|repair|make\s+it|adjust|style)\b/i.test(text) &&
+    !HINGLISH_EDIT_FIX_RE.test(rawText);
   if (isPureExplanation) return empty;
 
   const hasEditOrFixIntent =
-    /\b(fix|bug|broken|error|issue|crash|not\s+working|doesn'?t\s+work|repair|debug|patch|solve|resolve|change|update|edit|modify|adjust|tweak|improve|refine|enhance|polish|add|remove|delete|hide|show|move|align|center|resize|recolor|color|theme|font|dark\s+mode|light\s+mode|responsive|mobile|navbar|header|footer|button|modal|drawer|menu|form|cart|slider|tab|animation|hover|scroll|click|link|icon|logo|text|title|section|card|layout|spacing|padding|margin|border|shadow|make\s+(it|the|this)|still\s+(broken|not|showing|missing|overlapping)|also\s+(add|fix|change|include|make))\b/i.test(
+    /\b(fix|bug|broken|error|issue|crash|not\s+working|doesn'?t\s+work|repair|debug|patch|solve|resolve|change|update|edit|modify|adjust|tweak|improve|refine|enhance|polish|add|remove|delete|hide|show|move|align|center|resize|recolor|color|theme|font|dark\s+mode|light\s+mode|responsive|mobile|navbar|header|footer|hero|button|modal|drawer|menu|form|cart|slider|tab|animation|hover|scroll|click|link|icon|logo|text|title|section|card|layout|spacing|padding|margin|border|shadow|pricing|testimonials?|faq|make\s+(it|the|this)|looks?\s+(weird|broken|off|bad|cramped|ugly)|still\s+(broken|not|showing|missing|overlapping)|also\s+(add|fix|change|include|make))\b/i.test(
       text
-    );
+    ) || HINGLISH_EDIT_FIX_RE.test(rawText);
 
   if (!hasEditOrFixIntent) return empty;
 
@@ -1061,16 +1090,42 @@ const PROMPT_REQUIREMENT_CHECKS: Array<{
     codeRe: /(draggable|ondragstart|dragstart|pointerdown|UserInputService)/i,
     label: 'interactive drag-and-drop behavior',
   },
+  {
+    id: 'pricing-section',
+    promptRe: /\b(pricing\s*(section|table|plans?|cards?|tiers?)?)\b/i,
+    codeRe: /(pricing|\/mo|\/month|per\s*month|starter|pro\s*plan|enterprise|tier|₹\s*\d+|\$\s*\d+)/i,
+    label: 'pricing plans section',
+  },
+  {
+    id: 'testimonials-section',
+    promptRe: /\b(testimonials?|customer\s*reviews?)\b/i,
+    codeRe: /(testimonial|review|blockquote|quote|rating|★)/i,
+    label: 'testimonials / reviews section',
+  },
+  {
+    id: 'faq-accordion',
+    promptRe: /\b(faq|frequently\s*asked|accordion)\b/i,
+    codeRe: /(faq|frequently\s*asked|accordion|<details\b)/i,
+    label: 'FAQ / accordion section',
+  },
+  {
+    id: 'menu-catalog',
+    promptRe: /\b(menu\s*(section|card|list|items?)?|coffee\s*menu|food\s*menu)\b/i,
+    codeRe: /(menu|espresso|latte|cappuccino|item|price|add\s*to\s*(order|cart))/i,
+    label: 'interactive menu section',
+  },
 ];
 
 export function checkPromptRequirements(
   userPrompt: string,
-  blocks: ParsedCodeFence[]
+  blocks: ParsedCodeFence[],
+  extra?: { brandNames?: string[]; mustAvoid?: string[] }
 ): CodeVerificationIssue[] {
-  const prompt = (userPrompt ?? '').trim();
+  const prompt = normalizeUserPromptText(userPrompt ?? '');
   if (!prompt || blocks.length === 0) return [];
 
   const combinedCode = blocks.map((b) => b.code).join('\n');
+  const combinedLower = combinedCode.toLowerCase();
   const primary = blocks[0];
   const issues: CodeVerificationIssue[] = [];
 
@@ -1081,6 +1136,20 @@ export function checkPromptRequirements(
         language: primary.language,
         severity: 'error',
         message: `Prompt requirement not yet satisfied: missing ${req.label} requested by the user.`,
+      });
+    }
+  }
+
+  // Verify explicitly requested brand/app names actually appear in the generated code
+  const brandNames = Array.isArray(extra?.brandNames) ? extra.brandNames : [];
+  for (const brand of brandNames) {
+    const cleanBrand = brand.trim();
+    if (cleanBrand.length >= 2 && !combinedLower.includes(cleanBrand.toLowerCase())) {
+      issues.push({
+        file: primary.fileName,
+        language: primary.language,
+        severity: 'error',
+        message: `Prompt requirement not yet satisfied: user explicitly requested brand/name "${cleanBrand}", which is missing from the code.`,
       });
     }
   }
@@ -1112,6 +1181,8 @@ export function verifyCodeBlocks(
     requireLuaUiLibrary?: boolean;
     isHyper?: boolean;
     userPrompt?: string;
+    brandNames?: string[];
+    mustAvoid?: string[];
     followUpEditContext?: FollowUpCodeEditContext;
   }
 ): CodeVerificationReport {
@@ -1202,7 +1273,12 @@ export function verifyCodeBlocks(
   }
 
   if (options?.userPrompt) {
-    issues.push(...checkPromptRequirements(options.userPrompt, blocks));
+    issues.push(
+      ...checkPromptRequirements(options.userPrompt, blocks, {
+        brandNames: options.brandNames,
+        mustAvoid: options.mustAvoid,
+      })
+    );
   }
 
   if (options?.requireFullStackWebsite) {

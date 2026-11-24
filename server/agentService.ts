@@ -22,9 +22,15 @@ import {
 import {
   analyzeCodingIntent,
   detectFollowUpCodeEdit,
+  extractFencedCodeBlocks,
   runSandboxedJsCheck,
   verifyCodeBlocks,
 } from './codeVerifier.ts';
+import {
+  analyzePromptDeeply,
+  refinePromptUnderstandingWithAI,
+  type PromptComplexity,
+} from './promptUnderstanding.ts';
 import {
   GeminiRateLimitError,
   extractRetryDelayMs,
@@ -62,6 +68,24 @@ import type {
 
 const PRIMARY_MODEL = 'gemini-4-hydrogen';
 const FAST_MODEL = 'gemini-3.1-flash-lite';
+
+// Tracks temporary 60s cooldowns on models that just exhausted 429 quota so
+// multi-pass refinement loops immediately route to healthy capacity instead of re-sleeping 28s per pass.
+const modelQuotaCooldownUntil = new Map<string, number>();
+
+function isModelInQuotaCooldown(model: string): boolean {
+  const until = modelQuotaCooldownUntil.get(model);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    modelQuotaCooldownUntil.delete(model);
+    return false;
+  }
+  return true;
+}
+
+function markModelQuotaCooldown(model: string, durationMs = 60_000): void {
+  modelQuotaCooldownUntil.set(model, Date.now() + durationMs);
+}
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -395,6 +419,7 @@ async function generateStreamWithFallback(
     isHyper: boolean;
     fastMode: boolean;
     preferPrimaryCoding?: boolean;
+    complexity?: PromptComplexity;
     isLargeGeneration?: boolean;
     thinkingLevelOverride?: ThinkingLevel;
     onDelta?: (chunkText: string) => void;
@@ -430,12 +455,17 @@ async function generateStreamWithFallback(
     };
   };
 
-  // Clearly differentiate IND HYPER (always flagship PRIMARY_MODEL, unhurried deep thinking)
-  // vs Standard (snappy FAST_MODEL when Fast Mode is on, or lightweight PRIMARY_MODEL when off)
-  const usePrimaryFirst = options.isHyper || !options.fastMode;
-  const attemptModels = usePrimaryFirst
+  // Respect Fast Mode (snappy FAST_MODEL first with MEDIUM reasoning for complex/coding prompts)
+  // vs Deep/Hyper (flagship PRIMARY_MODEL first). If the preferred model just hit 429 quota cooldown,
+  // immediately prioritize the healthy alternate model so multi-pass refinement stays fast.
+  const preferPrimaryFirst = options.isHyper || !options.fastMode;
+  const baseOrder = preferPrimaryFirst
     ? [PRIMARY_MODEL, FAST_MODEL]
     : [FAST_MODEL, PRIMARY_MODEL];
+  const attemptModels =
+    isModelInQuotaCooldown(baseOrder[0]) && !isModelInQuotaCooldown(baseOrder[1])
+      ? [baseOrder[1], baseOrder[0]]
+      : baseOrder;
 
   let lastError: unknown;
   let totalAttempts = 0;
@@ -450,19 +480,23 @@ async function generateStreamWithFallback(
       const thinkingLevel =
         model === PRIMARY_MODEL
           ? (options.thinkingLevelOverride ??
-            (options.isHyper ? ThinkingLevel.HIGH : ThinkingLevel.LOW))
+            (options.isHyper
+              ? ThinkingLevel.HIGH
+              : options.complexity === 'complex' || options.preferPrimaryCoding
+                ? ThinkingLevel.MEDIUM
+                : ThinkingLevel.LOW))
           : options.isHyper
             ? ThinkingLevel.HIGH
-            : options.isLargeGeneration || options.preferPrimaryCoding
+            : options.isLargeGeneration || options.preferPrimaryCoding || options.complexity === 'complex'
               ? ThinkingLevel.MEDIUM
               : ThinkingLevel.LOW;
 
       const thinkingConfig = thinkingLevel ? { thinkingLevel } : undefined;
       const { tools, toolConfig } = buildToolsConfig(includeSearch);
 
-      // Search-grounded pass uses 1 quick retry before dropping to non-grounded on same model;
-      // non-grounded pass uses full exponential backoff (3 retries on primary, 2 on fallback model)
-      const maxRetries = includeSearch ? 1 : isLastModel ? 2 : 3;
+      // When an alternate model is still available (!isLastModel), fail over quickly after 1 short backoff;
+      // on the final model, run full exponential backoff retries before surfacing the cooldown card.
+      const maxRetries = includeSearch ? 1 : isLastModel ? 3 : 1;
 
       try {
         const { result, attemptsMade } = await withGeminiExponentialBackoff(
@@ -474,10 +508,10 @@ async function generateStreamWithFallback(
               : isLastModel
                 ? 60_000
                 : options.isLargeGeneration
-                  ? 45_000
+                  ? 55_000
                   : options.fastMode
-                    ? 20_000
-                    : 35_000;
+                    ? 25_000
+                    : 40_000;
             let receivedAnyChunk = false;
 
             const watchdog = setTimeout(() => {
@@ -578,9 +612,9 @@ async function generateStreamWithFallback(
           },
           {
             maxRetries,
-            baseDelayMs: includeSearch ? 1200 : 1800,
-            maxDelayMs: includeSearch ? 4000 : 16_000,
-            maxTotalWaitMs: includeSearch ? 5000 : 28_000,
+            baseDelayMs: includeSearch ? 1200 : isLastModel ? 1800 : 1500,
+            maxDelayMs: includeSearch ? 4000 : isLastModel ? 16_000 : 4500,
+            maxTotalWaitMs: includeSearch ? 5000 : isLastModel ? 28_000 : 6000,
             shouldRetry: (err) => {
               // If hybrid search tools were explicitly rejected (400), immediately drop search without sleeping
               if (includeSearch) {
@@ -648,7 +682,10 @@ async function generateStreamWithFallback(
           throw new Error(redactSecrets(formatGeminiError(lastError)));
         }
 
-        // Fail over to alternate model after exhausting exponential backoff on current model
+        // Fail over to alternate model after exhausting backoff on current model
+        if (isQuotaErr) {
+          markModelQuotaCooldown(model, 60_000);
+        }
         const nextModel = attemptModels[modelIdx + 1];
         options.onRetryStatus?.(
           isQuotaErr
@@ -735,39 +772,136 @@ export async function runAgentChatTurn(
   const skipAutoCodeVerify = Boolean(input.skipAutoCodeVerify);
 
   const safeHistory = Array.isArray(input.history) ? input.history : [];
-  const followUpEdit = skipAutoCodeVerify
+
+  // Check if history already has executable code blocks (for semantic follow-up edit fallback)
+  let latestHistoryCodeBlocks: Array<{ language: string; fileName: string; code: string }> = [];
+  for (let i = safeHistory.length - 1; i >= 0; i -= 1) {
+    const turn = safeHistory[i];
+    if (turn?.role === 'assistant' && typeof turn.content === 'string' && turn.content.includes('```')) {
+      const blocks = extractFencedCodeBlocks(turn.content);
+      if (blocks.length > 0) {
+        latestHistoryCodeBlocks = blocks;
+        break;
+      }
+    }
+  }
+
+  let followUpEdit = skipAutoCodeVerify
     ? {
         isFollowUpEdit: false,
-        previousFileNames: [],
+        previousFileNames: [] as string[],
         previousLineCount: 0,
         previousHasHtmlArtifact: false,
         wantsShrinkOrDelete: false,
-        latestCodeBlocks: [],
+        latestCodeBlocks: [] as Array<{ language: string; fileName: string; code: string }>,
       }
     : detectFollowUpCodeEdit(input.message, safeHistory);
 
-  // Step 0: Deep prompt-intent understanding
+  // Step 0: Deep 2-Layer Prompt Understanding (Layer 1 instant analyzer + Layer 2 fast semantic JSON planner)
   const rawIntent = analyzeCodingIntent(input.message, input.mode, input.attachments);
-  const intent = skipAutoCodeVerify
+  const intentTaskId = startTask('Understanding prompt intent', rawIntent.summary);
+
+  const baseBrief = analyzePromptDeeply({
+    message: input.message,
+    mode: input.mode,
+    attachments: input.attachments,
+    codingIntent: rawIntent,
+    followUpEdit,
+    historyCount: safeHistory.length,
+  });
+
+  const promptBrief = await refinePromptUnderstandingWithAI(ai, {
+    rawMessage: input.message,
+    history: safeHistory,
+    baseBrief,
+    hasPreviousCodeInHistory: latestHistoryCodeBlocks.length > 0,
+    previousFileNames: latestHistoryCodeBlocks.map((b) => b.fileName),
+  });
+
+  // If Layer-2 AI planner detected a subtle/Hinglish follow-up edit to previous code (and NOT prompt writing), activate in-place editing
+  if (
+    !skipAutoCodeVerify &&
+    !promptBrief.isPromptEngineering &&
+    !followUpEdit.isFollowUpEdit &&
+    promptBrief.semanticFollowUpEdit === true &&
+    latestHistoryCodeBlocks.length > 0
+  ) {
+    followUpEdit = {
+      isFollowUpEdit: true,
+      previousFileNames: latestHistoryCodeBlocks.map((b) => b.fileName),
+      previousLineCount: latestHistoryCodeBlocks.reduce(
+        (sum, b) => sum + b.code.trim().split('\n').length,
+        0
+      ),
+      previousHasHtmlArtifact: latestHistoryCodeBlocks.some(
+        (b) =>
+          (b.language === 'html' || b.language === 'htm') &&
+          (/<!doctype\s+html/i.test(b.code) || /<html[\s>]/i.test(b.code))
+      ),
+      wantsShrinkOrDelete: false,
+      latestCodeBlocks: latestHistoryCodeBlocks,
+    };
+  }
+
+  // If the user asked to write a prompt, strictly enforce prompt-only mode (never build a website!)
+  const isPromptEngineeringRequest =
+    skipAutoCodeVerify || promptBrief.isPromptEngineering || rawIntent.kind === 'prompt_engineering';
+  if (isPromptEngineeringRequest && followUpEdit.isFollowUpEdit) {
+    followUpEdit = {
+      isFollowUpEdit: false,
+      previousFileNames: [],
+      previousLineCount: 0,
+      previousHasHtmlArtifact: false,
+      wantsShrinkOrDelete: false,
+      latestCodeBlocks: [],
+    };
+  }
+
+  const effectiveSkipAutoCodeVerify = skipAutoCodeVerify || isPromptEngineeringRequest;
+
+  const intent = isPromptEngineeringRequest
     ? {
         ...rawIntent,
+        kind: 'prompt_engineering' as const,
         isWebsiteOrFullStack: false,
         isLuaUiLibrary: false,
         isHighLevelBuild: false,
         isCodingTask: false,
-        summary: 'Prompt engineering & structured specification',
+        isDebuggingTask: false,
+        wantsBackend: false,
+        wantsMultiFile: false,
+        summary: promptBrief.summaryLine || 'Prompt engineering & structured copyable prompt',
       }
     : followUpEdit.isFollowUpEdit
       ? {
           ...rawIntent,
           isCodingTask: true,
-          isDebuggingTask: rawIntent.isDebuggingTask || /\b(fix|bug|broken|error|crash|repair|debug)\b/i.test(input.message),
-          isWebsiteOrFullStack: rawIntent.isWebsiteOrFullStack || followUpEdit.previousHasHtmlArtifact,
-          summary: `In-place update to ${followUpEdit.previousFileNames[0] || 'existing code'} (preserving existing code)`,
+          isDebuggingTask:
+            rawIntent.isDebuggingTask ||
+            /\b(fix|bug|broken|error|crash|repair|debug|thik|kaam\s*nahi)\b/i.test(input.message),
+          isWebsiteOrFullStack:
+            rawIntent.isWebsiteOrFullStack || followUpEdit.previousHasHtmlArtifact,
+          summary: `In-place update to ${followUpEdit.previousFileNames[0] || 'existing code'} · ${promptBrief.primaryGoal.slice(0, 70)}`,
         }
-      : rawIntent;
-  const intentTaskId = startTask('Understanding prompt intent', intent.summary);
-  finishTask(intentTaskId, 'done');
+      : promptBrief.intentCategory === 'website_artifact'
+        ? {
+            ...rawIntent,
+            kind: 'build_app' as const,
+            isCodingTask: true,
+            isWebsiteOrFullStack: true,
+            isHighLevelBuild: true,
+            summary: promptBrief.summaryLine,
+          }
+        : {
+            ...rawIntent,
+            summary: promptBrief.summaryLine || rawIntent.summary,
+          };
+
+  finishTask(
+    intentTaskId,
+    'done',
+    promptBrief.refinedByAi ? `${intent.summary} (verified)` : intent.summary
+  );
 
   const preferPrimaryCoding = intent.isCodingTask;
   const modelLabel = isHyper
@@ -812,6 +946,7 @@ export async function runAgentChatTurn(
     memoryEnabled,
     memoryFacts,
     intent,
+    promptBrief,
     followUpEdit,
     customInstructions,
   });
@@ -885,21 +1020,33 @@ export async function runAgentChatTurn(
             : 'Balanced Mode'
     );
 
+    const promptNeedsLiveWebLookup =
+      /https?:\/\/|\b(latest|current|today|news|weather|price|stock|exchange\s*rate|release|version|docs|documentation|search\s+the\s+web|google|look\s+up|find\s+online|who\s+is|what\s+is\s+the\s+latest|2025|2026)\b/i.test(
+        input.message
+      );
+    const shouldEnableWebSearch =
+      !isPromptEngineeringRequest &&
+      !followUpEdit.isFollowUpEdit &&
+      (promptNeedsLiveWebLookup ||
+        (!intent.isWebsiteOrFullStack && !intent.isLuaUiLibrary));
+
     let streamed;
     try {
       streamed = await generateStreamWithFallback(ai, contents, systemInstruction, {
-        useTools: true,
-        enableWebSearch: true,
+        useTools: !isPromptEngineeringRequest,
+        enableWebSearch: shouldEnableWebSearch,
         excludeVerifyTool:
           (intent.isWebsiteOrFullStack || intent.isHighLevelBuild) && !intent.isDebuggingTask,
         isHyper,
         fastMode,
         preferPrimaryCoding,
+        complexity: promptBrief.complexity,
         isLargeGeneration:
-          intent.isWebsiteOrFullStack ||
-          intent.isHighLevelBuild ||
-          intent.wantsMultiFile ||
-          followUpEdit.previousLineCount >= 120,
+          !isPromptEngineeringRequest &&
+          (intent.isWebsiteOrFullStack ||
+            intent.isHighLevelBuild ||
+            intent.wantsMultiFile ||
+            followUpEdit.previousLineCount >= 120),
         onDelta: (chunkText) => {
           finishActiveRetryTask();
           input.onEvent?.({ type: 'delta', text: chunkText });
@@ -947,6 +1094,53 @@ export async function runAgentChatTurn(
       let selfReviewApplied = false;
       let codeVerification: CodeVerificationSummary | undefined;
 
+      // Belt-and-suspenders guard: if user asked to WRITE A PROMPT, NEVER return an accidental HTML website!
+      if (
+        isPromptEngineeringRequest &&
+        finalReply &&
+        (/```(?:html|htm)\b/i.test(finalReply) || /<!doctype\s+html/i.test(finalReply)) &&
+        !/```prompt\b/i.test(finalReply)
+      ) {
+        const promptFixTaskId = startTask(
+          'Formatting copy-ready prompt (text prompt only)',
+          'Preventing unintended website build'
+        );
+        try {
+          const rewriteRes = await generateStreamWithFallback(
+            ai,
+            [
+              {
+                role: 'user',
+                parts: [
+                  {
+                    text: `The user asked you to WRITE A PROMPT (NOT build a website or code):\n"${input.message}"\n\nConvert your answer into ONLY a clean, rich, copy-ready prompt inside a \`\`\`prompt:<Descriptive Title> fenced block (with zero HTML/CSS/JS code blocks).`,
+                  },
+                ],
+              },
+            ],
+            'You are an expert Prompt Engineer. Output ONLY a brief 1-line intro, one deeply structured ```prompt:<Title> fenced block with [PLACEHOLDERS], and 2 short usage tips outside the block. NEVER output HTML, CSS, or JavaScript code.',
+            {
+              useTools: false,
+              enableWebSearch: false,
+              isHyper: false,
+              fastMode: false,
+              complexity: 'standard',
+              thinkingLevelOverride: ThinkingLevel.LOW,
+              onRetryStatus,
+            }
+          );
+          finishActiveRetryTask();
+          if (rewriteRes.text?.trim()) {
+            finalReply = rewriteRes.text.trim();
+            input.onEvent?.({ type: 'replace', text: finalReply });
+          }
+          finishTask(promptFixTaskId, 'done', 'Delivered copyable prompt');
+        } catch {
+          finishActiveRetryTask();
+          finishTask(promptFixTaskId, 'done');
+        }
+      }
+
       // IND HYPER CODING MODEL (Plus only): smart Pass 2 Visual Design & Engineering Elevation Pass
       // Runs automatically when Pass 1 is shorter than epic target depth or has any verification issues,
       // while avoiding a redundant 90s full-file rewrite when Pass 1 already delivered a rich, verified build.
@@ -957,6 +1151,9 @@ export async function runAgentChatTurn(
         requireHighLevelCode: intent.isHighLevelBuild,
         requireLuaUiLibrary: intent.isLuaUiLibrary,
         isHyper,
+        userPrompt: input.message,
+        brandNames: promptBrief.brandNames,
+        mustAvoid: promptBrief.mustAvoid,
         followUpEditContext: followUpEdit.isFollowUpEdit ? followUpEdit : undefined,
       };
       const pass1LineCount = finalReply.split('\n').length;
@@ -968,13 +1165,13 @@ export async function runAgentChatTurn(
             ? 280
             : 180;
       const pass1Report =
-        isHyper && hasCodeBlocks && !skipAutoCodeVerify
+        isHyper && hasCodeBlocks && !effectiveSkipAutoCodeVerify
           ? verifyCodeBlocks(finalReply, verifyOptsPreCheck)
           : null;
       const needsHyperElevation =
         isHyper &&
         Boolean(finalReply) &&
-        !skipAutoCodeVerify &&
+        !effectiveSkipAutoCodeVerify &&
         !followUpEdit.isFollowUpEdit &&
         (hasCodeBlocks || input.mode === 'coding') &&
         (pass1LineCount < epicTargetLines || Boolean(pass1Report && !pass1Report.passed));
@@ -1040,7 +1237,7 @@ export async function runAgentChatTurn(
 
       // Automatic Iterative Code Verification, Requirement-Satisfaction & Self-Debugging Loop
       // Runs up to 4 paced repair/expansion passes inside 1 single message until all user requirements & quality checks pass.
-      if (!skipAutoCodeVerify && debugLoop && finalReply && /```/.test(finalReply)) {
+      if (!effectiveSkipAutoCodeVerify && debugLoop && finalReply && /```/.test(finalReply)) {
         const maxDebugLoops = 5; // 1 initial check + up to 4 paced iterative repair/expansion passes
         const loopStartMs = Date.now();
         const maxLoopBudgetMs = isHyper ? 165_000 : 105_000;
@@ -1053,6 +1250,8 @@ export async function runAgentChatTurn(
           requireLuaUiLibrary: intent.isLuaUiLibrary,
           isHyper,
           userPrompt: input.message,
+          brandNames: promptBrief.brandNames,
+          mustAvoid: promptBrief.mustAvoid,
           followUpEditContext: followUpEdit.isFollowUpEdit ? followUpEdit : undefined,
         };
         let latestReport = verifyCodeBlocks(finalReply, verifyOpts);
@@ -1159,7 +1358,12 @@ export async function runAgentChatTurn(
                 fixContents,
                 buildAutoDebugFixPrompt(
                   latestReport.issues.filter((i) => i.severity === 'error'),
-                  attempt
+                  attempt,
+                  {
+                    brandNames: promptBrief.brandNames,
+                    mustAvoid: promptBrief.mustAvoid,
+                    mustInclude: promptBrief.mustInclude,
+                  }
                 ),
                 {
                   useTools: false,
